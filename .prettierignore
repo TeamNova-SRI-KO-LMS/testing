@@ -1,0 +1,8 @@
+node_modules
+.sut
+reports
+coverage
+docs/testing/TEST_REGISTER.md
+docs/testing/TRACEABILITY_MATRIX.md
+docs/security/OWASP_COMPLIANCE.md
+package-lock.json
