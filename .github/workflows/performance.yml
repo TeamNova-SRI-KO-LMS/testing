@@ -1,0 +1,130 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+name: Performance Tests
+
+# SENG 34213 §10.1 #9 — the performance test results submitted with the final
+# report, and NFR-01 in the requirements catalogue.
+#
+# Load testing is meaningless on a shared runner that another job is competing
+# with, and it takes minutes rather than seconds, so it runs on a schedule and
+# on demand rather than on every push.
+
+on:
+  schedule:
+    # Sunday 03:00 UTC — a weekly trend line, which is what makes a performance
+    # number useful. A single measurement says nothing about a regression.
+    - cron: '0 3 * * 0'
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: 'Which scenario to run'
+        required: true
+        default: 'smoke'
+        type: choice
+        options: [smoke, load, stress, spike, all]
+      base_url:
+        description: 'Target an already-deployed environment (leave empty to boot one)'
+        required: false
+        type: string
+
+env:
+  NODE_VERSION: '20.x'
+  SUT_REPOSITORY: ${{ vars.SUT_REPOSITORY || 'TeamNova-SRI-KO-LMS/app' }}
+  SUT_REF: ${{ vars.SUT_REF || 'develop' }}
+
+jobs:
+  performance:
+    name: k6 Performance Suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    services:
+      mongodb:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.adminCommand({ ping: 1 })'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out the application under test
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SUT_REPOSITORY }}
+          ref: ${{ env.SUT_REF }}
+          path: .sut/app
+          token: ${{ secrets.SUT_ACCESS_TOKEN || github.token }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+      - run: npm ci --no-audit --no-fund --prefix .sut/app/Backend
+
+      - name: Install k6
+        run: |
+          sudo gpg --no-default-keyring \
+            --keyring /usr/share/keyrings/k6-archive-keyring.gpg \
+            --keyserver hkp://keyserver.ubuntu.com:80 \
+            --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" \
+            | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update
+          sudo apt-get install --yes k6
+
+      - name: Start the application
+        if: inputs.base_url == ''
+        run: |
+          npm run start --prefix .sut/app/Backend &
+          # Wait for the health endpoint rather than sleeping a fixed time: a
+          # cold start varies, and a fixed sleep either wastes time or races.
+          for attempt in $(seq 1 30); do
+            if curl --silent --fail http://localhost:5001/api/health > /dev/null; then
+              echo "Application is healthy after ${attempt}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "The application did not become healthy within 30s"
+          exit 1
+        env:
+          NODE_ENV: test
+          PORT: 5001
+          MONGODB_URI: mongodb://127.0.0.1:27017/sriko_lms_perf
+          JWT_SECRET: seng34213-performance-jwt-secret
+          SESSION_SECRET: seng34213-performance-session-secret
+
+      - name: Run the performance scenarios
+        run: |
+          if [ "${{ inputs.scenario }}" = "all" ] || [ -z "${{ inputs.scenario }}" ]; then
+            npm run test:perf
+          else
+            npm run test:perf -- --scenario "${{ inputs.scenario }}"
+          fi
+        env:
+          SUT_PATH: .sut/app
+          PERF_BASE_URL: ${{ inputs.base_url || 'http://localhost:5001' }}
+
+      - name: Upload the performance report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-report
+          path: |
+            reports/performance/
+            reports/performance-report.md
+          retention-days: 90
+
+      - name: Add the results to the run summary
+        if: always()
+        run: |
+          if [ -f reports/performance-report.md ]; then
+            cat reports/performance-report.md >> "$GITHUB_STEP_SUMMARY"
+          fi
